@@ -18,3 +18,9 @@ do
     fi
   fi
 done
+// script to kill background services
+echo: "Updated script".
+AWS_ACCESS_KEY:
+SECRET:
+REGION:
+
