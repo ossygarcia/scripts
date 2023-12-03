@@ -1,0 +1,123 @@
+- name: SHELL| get nics from server
+  shell: nmcli --terse connection show
+  register: remote_nics_list
+  changed_when: false
+  check_mode: 'no'
+- name: SHELL| get nics info from server
+  shell: "echo \"{{item.split(':')[0]}}=$(ethtool {{item.split(':')[0]}} | grep Speed | sed -e 's/Speed://g' -e 's/^[ \t]*//');$(nmcli --escape no -g GENERAL.HWADDR device show {{item.split(':')[0]}});$(nmcli -g connection.uuid connection show {{item.split(':')[1]}});$(nmcli -g ipv4.method connection show {{item.split(':')[1]}})\""
+  register: remote_nics_info_raw
+  when:
+    - 'item.split('':'')|length == 4'
+  with_items: '{{ remote_nics_list.stdout_lines }}'
+  changed_when: false
+  check_mode: 'no'
+- name: make a NIC list from stdouts
+  set_fact: >-
+    remote_nics_info="{{ remote_nics_info_raw.results |
+    selectattr('stdout','defined') | map(attribute='stdout') | map('trim') |
+    list }}"
+- name: SET_FACT| build dictionary with nics info
+  set_fact:
+    dict_carte: >-
+      {{ dict_carte|default({}) | combine({item.split('=')[0]:{'carte':
+      item.split('=')[0], 'vitesse': item.split('=')[1].split(';')[0],
+      'macaddr': item.split('=')[1].split(';')[1], 'uuid':
+      item.split('=')[1].split(';')[2], 'ipv4_method':
+      item.split('=')[1].split(';')[3]}}) }}
+  with_items: '{{ remote_nics_info }}'
+  changed_when: false
+- name: get bond files status in /sys/class/net/
+  stat:
+    path: '/sys/class/net/{{ item.bond_name }}'
+  register: stat_bond_result
+  with_items:
+    - '{{ ul_bonding_bond_info }}'
+- name: get mac address for each bond definition
+  shell: >-
+    echo ${HOSTNAME}{{ item.bond_name }}|md5sum|sed
+    's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/06:\1:\2:\3:\4:\5/'
+  register: ul_result
+  with_items:
+    - '{{ ul_bonding_bond_info }}'
+  when: item.bond_state == 'present'
+  changed_when: false
+  check_mode: 'no'
+- name: set fact value from mac forging result
+  set_fact:
+    mymacaddr: '{{ item.stdout }}'
+  with_items:
+    - '{{ ul_result.results }}'
+  when: item.item.bond_state == 'present'
+- name: Setting defroute option for IC nic
+  lineinfile:
+    path: '/etc/sysconfig/network-scripts/ifcfg-{{ ul_bonding_ic_nic }}'
+    regexp: ^DEFROUTE
+    line: >-
+      {% if ul_bonding_ic_defroute %}DEFROUTE=yes{% else %}DEFROUTE=no{% endif
+      %}
+  notify: restart_network
+- name: Setting PEERROUTES for IC nic
+  lineinfile:
+    path: '/etc/sysconfig/network-scripts/ifcfg-{{ ul_bonding_ic_nic }}'
+    regexp: ^PEERROUTES
+    line: >-
+      {% if ul_bonding_ic_defroute %}PEERROUTES=yes{% else %}PEERROUTES=no{%
+      endif %}
+  notify: restart_network
+- name: configure bonding
+  template:
+    src: templates/bond.j2
+    dest: '/etc/sysconfig/network-scripts/ifcfg-{{ item.bond_name }}'
+  with_items:
+    - '{{ ul_bonding_bond_info }}'
+  when: item.bond_state == 'present'
+  notify: restart_network
+- name: Remove ip link config for bondx file if requested
+  shell: 'ip link delete {{ item.item.bond_name }} '
+  with_items:
+    - '{{ stat_bond_result.results }}'
+  when: item.stat.exists and item.item.bond_state == 'absent'
+  notify: restart_network
+- name: Remove bonding file if requested
+  file:
+    path: '/etc/sysconfig/network-scripts/ifcfg-{{ item.bond_name }}'
+    state: absent
+  when: item.bond_state == 'absent'
+  with_items:
+    - '{{ ul_bonding_bond_info }}'
+  notify: restart_network
+- name: configure bonding vlan tagged
+  template:
+    src: templates/bond.vlan.j2
+    dest: >-
+      /etc/sysconfig/network-scripts/ifcfg-{{ item.0.bond_name }}.{{
+      item.1.vlan.vlan_id }}
+  with_subelements:
+    - '{{ ul_bonding_bond_info }}'
+    - bond_vlan
+  when:
+    - item.0.bond_vlan_tagging
+    - item.0.bond_state == 'present'
+    - item.1.vlan.vlan_state == 'present'
+  notify: restart_network
+- name: Remove bond vlan tagged file if requested
+  file:
+    path: >-
+      /etc/sysconfig/network-scripts/ifcfg-{{ item.0.bond_name }}.{{
+      item.1.vlan.vlan_id }}
+    state: absent
+  when: >-
+    item.0.bond_state == 'absent' or not item.0.bond_vlan_tagging or
+    item.1.vlan.vlan_state == 'absent'
+  with_subelements:
+    - '{{ ul_bonding_bond_info }}'
+    - bond_vlan
+  notify: restart_network
+- name: FILE| Apply jinja template to bonded nics
+  template:
+    src: templates/bonded_nic.j2
+    dest: '/etc/sysconfig/network-scripts/ifcfg-{{ item.1 }}'
+  with_subelements:
+    - '{{ ul_bonding_bond_info }}'
+    - bonded_nics
+  notify: restart_network
